@@ -79,11 +79,11 @@ DEFAULT_IDLE_TIMEOUT = 300.0
 # idle seeded identity is closed to make room; if none is idle, launch fails 503.
 DEFAULT_MAX_PROCESSES = 8
 
-# Window sizes tried, largest first, when the binary cannot present a coherent
-# maximized window. See ChromePool._settle_window.
-WINDOW_SIZE_CANDIDATES = (
-    (1600, 900), (1536, 864), (1440, 900), (1366, 768), (1280, 800), (1280, 720),
-)
+# Window sizes tried, largest first, as fractions of the available screen, when
+# the binary cannot present a coherent maximized window. Fractions, not pixels:
+# personas report different screens (1920x1080 Windows, 1440x900 macOS).
+# See ChromePool._settle_window.
+WINDOW_SIZE_FRACTIONS = (0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5)
 # Chrome's frame border on each side of a normal (not maximized) window on X11.
 WINDOW_FRAME_BORDER = 4
 
@@ -230,20 +230,19 @@ def window_geometry_fits(geometry: dict) -> bool:
     )
 
 
-def viewport_origin(bounds: dict, viewport_height: float) -> tuple[int, int]:
-    """Real screen position of a page's viewport top-left corner.
+def viewport_origin(bounds: dict, viewport_height: float, device_scale_factor: float = 1.0) -> tuple[int, int]:
+    """Real screen position, in X11 pixels, of a page's viewport top-left corner.
 
-    viewport_height is in screen pixels (page zoom applied).
-
-    The page's own screenX/screenY are spoofed, so the origin comes from the real
-    window bounds: the viewport sits inside the frame border, flush with the
-    bottom of the window, below Chrome's toolbars. Assumes no horizontal
-    scrollbar on the top-level page.
+    bounds are CDP window bounds (device-independent pixels); viewport_height is
+    in device pixels. The page's own screenX/screenY are spoofed, so the origin
+    comes from the real window bounds: the viewport sits inside the frame border,
+    flush with the bottom of the window, below Chrome's toolbars. Assumes no
+    horizontal scrollbar on the top-level page.
     """
     border = 0 if bounds["windowState"] in ("maximized", "fullscreen") else WINDOW_FRAME_BORDER
-    left = bounds["left"] + border
-    top = bounds["top"] + bounds["height"] - border - round(viewport_height)
-    return left, top
+    left = (bounds["left"] + border) * device_scale_factor
+    top = (bounds["top"] + bounds["height"] - border) * device_scale_factor - viewport_height
+    return round(left), round(top)
 
 
 class CdpSession:
@@ -280,6 +279,7 @@ class ChromePool:
         default_seed: str | None = None,
         default_locale: str | None = None,
         default_timezone: str | None = None,
+        default_fingerprint_args: list[str] | None = None,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
         default_geoip: bool = False,
         max_processes: int = DEFAULT_MAX_PROCESSES,
@@ -291,6 +291,7 @@ class ChromePool:
         self._default_seed = default_seed
         self._default_locale = default_locale
         self._default_timezone = default_timezone
+        self._default_fingerprint_args = default_fingerprint_args or []
         self._idle_timeout = idle_timeout
         self._default_geoip = default_geoip
         self._max_processes = max_processes
@@ -482,8 +483,9 @@ class ChromePool:
                         content_type="application/json",
                     )
 
-            # Build Chrome args via shared logic
-            fp_extra = [f"--fingerprint={actual_seed}"]
+            # Build Chrome args via shared logic; CLI fingerprint flags are
+            # defaults that per-connection params override.
+            fp_extra = [f"--fingerprint={actual_seed}"] + self._default_fingerprint_args
             if extra_args:
                 fp_extra.extend(extra_args)
             if proxy:
@@ -621,7 +623,12 @@ class ChromePool:
             await cdp.send("Page.navigate", {"url": "about:blank"})
             window_id = (await cdp.send("Browser.getWindowForTarget"))["windowId"]
             await cdp.send("Browser.setWindowBounds", {"windowId": window_id, "bounds": {"windowState": "normal"}})
-            for width, height in WINDOW_SIZE_CANDIDATES:
+            screen = await self._reported_geometry(cdp)
+            candidates = [
+                (round(screen["availWidth"] * fraction), round(screen["availHeight"] * fraction))
+                for fraction in WINDOW_SIZE_FRACTIONS
+            ]
+            for width, height in candidates:
                 await cdp.send("Browser.setWindowBounds", {"windowId": window_id, "bounds": {"width": width, "height": height}})
                 geometry = await self._reported_geometry(cdp)
                 if not window_geometry_fits(geometry):
@@ -639,7 +646,7 @@ class ChromePool:
                     geometry["availWidth"], geometry["availHeight"],
                 )
                 return
-        raise RuntimeError(f"no window size in {WINDOW_SIZE_CANDIDATES} keeps the reported window on screen")
+        raise RuntimeError(f"no window size in {candidates} keeps the reported window on screen")
 
     @staticmethod
     async def _reported_geometry(cdp: CdpSession) -> dict:
@@ -812,7 +819,8 @@ INPUT_ACTION_TYPES = {"move", "path", "down", "up", "click", "wheel", "type", "k
 def xdotool_commands(action: dict, origin: tuple[int, int], zoom: float = 1.0) -> list[tuple[float, list[str]]]:
     """Translate one input action into (delay_seconds, xdotool argv) steps.
 
-    Coordinates are CSS pixels; page zoom scales them to screen pixels.
+    Coordinates are CSS pixels; zoom (page zoom times device scale factor)
+    scales them to X11 pixels.
     """
     kind = action["type"]
     left, top = origin
@@ -882,8 +890,10 @@ async def handle_input(request: web.Request) -> web.Response:
     viewport = metrics["visualViewport"]
     if viewport.get("scale", 1) != 1:
         return web.json_response({"error": "native input needs a page without pinch zoom"}, status=409)
-    zoom = viewport.get("zoom", 1)
-    origin = viewport_origin(window["bounds"], viewport["clientHeight"])
+    # CSS -> device pixels covers page zoom and the device scale factor together
+    zoom = viewport["clientWidth"] / metrics["cssVisualViewport"]["clientWidth"]
+    device_scale_factor = zoom / viewport.get("zoom", 1)
+    origin = viewport_origin(window["bounds"], viewport["clientHeight"], device_scale_factor)
 
     for action in actions:
         for delay, argv in xdotool_commands(action, origin, zoom):
@@ -1160,6 +1170,7 @@ def parse_cli_args(argv: list[str]) -> tuple[dict, list[str]]:
         "default_seed": None,
         "default_locale": None,
         "default_timezone": None,
+        "default_fingerprint_args": [],
         "idle_timeout": _default_idle_timeout(),
         "max_processes": _parse_max_processes(os.environ.get("CLOAKSERVE_MAX_PROCESSES", str(DEFAULT_MAX_PROCESSES))),
         "geoip": _parse_bool(os.environ.get("CLOAKSERVE_GEOIP", "false")),
@@ -1199,6 +1210,10 @@ def parse_cli_args(argv: list[str]) -> tuple[dict, list[str]]:
             config["default_timezone"] = arg.split("=", 1)[1]
         elif arg.startswith("--fingerprint="):
             config["default_seed"] = arg.split("=", 1)[1]
+        elif arg.startswith("--fingerprint-"):
+            # Through build_args, so persona-dependent defaults (hardware
+            # profile) follow e.g. --fingerprint-platform=macos
+            config["default_fingerprint_args"].append(arg)
         else:
             passthrough.append(arg)
 
@@ -1231,6 +1246,7 @@ def main() -> None:
         default_seed=config["default_seed"],
         default_locale=config["default_locale"],
         default_timezone=config["default_timezone"],
+        default_fingerprint_args=config["default_fingerprint_args"],
         idle_timeout=config["idle_timeout"],
         default_geoip=config["geoip"],
         max_processes=config["max_processes"],

@@ -7,8 +7,10 @@
 # returning 502 forever. See CloakHQ/CloakBrowser#283.
 rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
 
-# Start Xvfb for headed mode (Turnstile, CAPTCHAs), then run user command
-Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp &
+# Start Xvfb for headed mode (Turnstile, CAPTCHAs), then run user command.
+# CLOAKBROWSER_DISPLAY_SIZE sets the virtual screen; the macOS persona reports a
+# Retina DPR of 2 only on a large display (e.g. 3840x2160).
+Xvfb :99 -screen 0 "${CLOAKBROWSER_DISPLAY_SIZE:-1920x1080}x24" -nolisten tcp &
 
 # Wait for the X server to actually accept connections before starting the WM.
 # A blind `sleep 1` races under a CPU-starved start: openbox can come up before

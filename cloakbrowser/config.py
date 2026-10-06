@@ -82,29 +82,40 @@ def get_default_stealth_args() -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Windows hardware profiles — keep GPU, CPU threads, and memory coherent.
+# Hardware profiles — keep GPU, CPU threads, and memory coherent per persona.
 # Free binaries pair every seed with 8 threads and 8 GB whatever GPU the seed
 # lands on, which yields pairings no real machine has (an RTX 5090 next to 8
-# threads, a laptop GPU on a 1080p DPR-1 desktop screen). Each profile below is
-# a common desktop pairing; the seed picks one deterministically, so the same
-# seed is still the same machine. Desktop NVIDIA only, so the binary's D3D11
-# WebGL parameter set keeps matching the renderer string.
-# navigator.deviceMemory is capped at 8 by Chrome, so every profile reports 8.
+# threads, an M2 Pro with 8 threads where real ones have 10 or 12). Each profile
+# below is a real pairing; the seed picks one deterministically, so the same
+# seed is still the same machine. navigator.deviceMemory is capped at 8 by
+# Chrome, so every profile reports 8.
+#
+# Windows: desktop NVIDIA only, so the binary's D3D11 WebGL parameter set keeps
+# matching the renderer string. macOS: the chips of 13" MacBook Airs, whose
+# default 1440x900 Retina screen is what the macOS persona reports.
 # ---------------------------------------------------------------------------
-WINDOWS_HARDWARE_PROFILES: tuple[tuple[str, int], ...] = (
-    ("NVIDIA GeForce GTX 1650 (0x00001F82)", 8),
-    ("NVIDIA GeForce GTX 1660 SUPER (0x000021C4)", 12),
-    ("NVIDIA GeForce RTX 2060 (0x00001F08)", 12),
-    ("NVIDIA GeForce RTX 3060 (0x00002503)", 12),
-    ("NVIDIA GeForce RTX 3060 (0x00002503)", 16),
-    ("NVIDIA GeForce RTX 3060 Ti (0x00002489)", 16),
-    ("NVIDIA GeForce RTX 3070 (0x00002484)", 16),
-    ("NVIDIA GeForce RTX 4060 (0x00002882)", 12),
-    ("NVIDIA GeForce RTX 4060 (0x00002882)", 16),
-    ("NVIDIA GeForce RTX 4060 Ti (0x00002803)", 16),
-    ("NVIDIA GeForce RTX 4070 (0x00002786)", 20),
-    ("NVIDIA GeForce RTX 4070 SUPER (0x00002783)", 20),
-)
+HARDWARE_PROFILES: dict[str, tuple[str, tuple[tuple[str, int], ...]]] = {
+    "windows": ("NVIDIA", (
+        ("ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 (0x00001F82) Direct3D11 vs_5_0 ps_5_0, D3D11)", 8),
+        ("ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 SUPER (0x000021C4) Direct3D11 vs_5_0 ps_5_0, D3D11)", 12),
+        ("ANGLE (NVIDIA, NVIDIA GeForce RTX 2060 (0x00001F08) Direct3D11 vs_5_0 ps_5_0, D3D11)", 12),
+        ("ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 (0x00002503) Direct3D11 vs_5_0 ps_5_0, D3D11)", 12),
+        ("ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 (0x00002503) Direct3D11 vs_5_0 ps_5_0, D3D11)", 16),
+        ("ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Ti (0x00002489) Direct3D11 vs_5_0 ps_5_0, D3D11)", 16),
+        ("ANGLE (NVIDIA, NVIDIA GeForce RTX 3070 (0x00002484) Direct3D11 vs_5_0 ps_5_0, D3D11)", 16),
+        ("ANGLE (NVIDIA, NVIDIA GeForce RTX 4060 (0x00002882) Direct3D11 vs_5_0 ps_5_0, D3D11)", 12),
+        ("ANGLE (NVIDIA, NVIDIA GeForce RTX 4060 (0x00002882) Direct3D11 vs_5_0 ps_5_0, D3D11)", 16),
+        ("ANGLE (NVIDIA, NVIDIA GeForce RTX 4060 Ti (0x00002803) Direct3D11 vs_5_0 ps_5_0, D3D11)", 16),
+        ("ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 (0x00002786) Direct3D11 vs_5_0 ps_5_0, D3D11)", 20),
+        ("ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 SUPER (0x00002783) Direct3D11 vs_5_0 ps_5_0, D3D11)", 20),
+    )),
+    "macos": ("Apple", (
+        ("ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)", 8),
+        ("ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)", 8),
+        ("ANGLE (Apple, ANGLE Metal Renderer: Apple M3, Unspecified Version)", 8),
+        ("ANGLE (Apple, ANGLE Metal Renderer: Apple M4, Unspecified Version)", 10),
+    )),
+}
 
 HARDWARE_PROFILE_FLAGS = (
     "--fingerprint-gpu-vendor",
@@ -114,15 +125,14 @@ HARDWARE_PROFILE_FLAGS = (
 )
 
 
-def windows_hardware_profile_args(seed: str) -> list[str]:
-    """Return coherent GPU/CPU/memory flags for a Windows persona seed."""
+def hardware_profile_args(platform_name: str, seed: str) -> list[str]:
+    """Return coherent GPU/CPU/memory flags for a persona and seed."""
+    vendor, profiles = HARDWARE_PROFILES[platform_name]
     digest = hashlib.sha256(seed.encode()).digest()
-    renderer, threads = WINDOWS_HARDWARE_PROFILES[
-        int.from_bytes(digest[:4], "big") % len(WINDOWS_HARDWARE_PROFILES)
-    ]
+    renderer, threads = profiles[int.from_bytes(digest[:4], "big") % len(profiles)]
     return [
-        "--fingerprint-gpu-vendor=Google Inc. (NVIDIA)",
-        f"--fingerprint-gpu-renderer=ANGLE (NVIDIA, {renderer} Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        f"--fingerprint-gpu-vendor=Google Inc. ({vendor})",
+        f"--fingerprint-gpu-renderer={renderer}",
         f"--fingerprint-hardware-concurrency={threads}",
         "--fingerprint-device-memory=8",
     ]

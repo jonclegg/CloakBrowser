@@ -25,12 +25,13 @@ from .config import (
     BINARY_DEFAULT_LOCALE,
     DEFAULT_VIEWPORT,
     HARDWARE_PROFILE_FLAGS,
+    HARDWARE_PROFILES,
     IGNORE_DEFAULT_ARGS,
     binary_supports_headless_no_viewport,
     binary_supports_http_proxy_inline_auth,
     binary_supports_maximized_window,
     get_default_stealth_args,
-    windows_hardware_profile_args,
+    hardware_profile_args,
 )
 from .download import ensure_binary
 from .license import (
@@ -1431,17 +1432,20 @@ def build_args(
                 logger.debug("Arg override: %s -> %s", seen[key], arg)
             seen[key] = arg
 
-    # Coherent GPU/CPU/memory for the Windows persona, chosen by the final seed.
-    # Skipped entirely when the caller set any hardware flag, so a partial
-    # override never gets mixed with a profile it does not belong to.
+    # Coherent GPU/CPU/memory for a spoofed persona, chosen by the final seed.
+    # Linux hosts only: elsewhere the persona is the native platform and the real
+    # GPU renders. Skipped entirely when the caller set any hardware flag, so a
+    # partial override never gets mixed with a profile it does not belong to.
+    persona = seen.get("--fingerprint-platform", "").split("=", 1)[-1]
     if (
         stealth_args
-        and seen.get("--fingerprint-platform") == "--fingerprint-platform=windows"
+        and _platform.system() == "Linux"
+        and persona in HARDWARE_PROFILES
         and "--fingerprint" in seen
         and not any(flag in seen for flag in HARDWARE_PROFILE_FLAGS)
     ):
         seed = seen["--fingerprint"].split("=", 1)[1]
-        for arg in windows_hardware_profile_args(seed):
+        for arg in hardware_profile_args(persona, seed):
             seen[arg.split("=", 1)[0]] = arg
 
     # Playwright's default launch args switch off a browser feature that stock Chrome

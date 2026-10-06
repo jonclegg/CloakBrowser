@@ -103,6 +103,11 @@ class TestParseCliArgs:
         assert config["geoip"] is False
         assert passthrough == []
 
+    def test_fingerprint_flags_become_launch_defaults(self):
+        config, passthrough = parse_cli_args(["--fingerprint-platform=macos", "--no-sandbox"])
+        assert config["default_fingerprint_args"] == ["--fingerprint-platform=macos"]
+        assert passthrough == ["--no-sandbox"]
+
     def test_geoip_and_max_processes(self):
         config, passthrough = parse_cli_args(["--geoip", "--max-processes=3"])
         assert config["geoip"] is True
@@ -831,6 +836,10 @@ class TestWindowGeometry:
     def test_viewport_origin_maximized(self):
         bounds = {"left": 0, "top": 0, "width": 1920, "height": 1080, "windowState": "maximized"}
         assert viewport_origin(bounds, 907) == (0, 173)
+
+    def test_viewport_origin_retina(self):
+        bounds = {"left": 64, "top": 102, "width": 1224, "height": 684, "windowState": "normal"}
+        assert viewport_origin(bounds, 1118, device_scale_factor=2) == (136, 446)
 
     def test_viewport_origin_normal_window(self):
         bounds = {"left": 300, "top": 120, "width": 1200, "height": 800, "windowState": "normal"}

@@ -1,5 +1,9 @@
 """Unit tests for build_args timezone/locale injection and timezone alias."""
 
+from unittest.mock import patch
+
+import pytest
+
 from cloakbrowser.browser import build_args, _resolve_timezone
 
 
@@ -236,6 +240,19 @@ def test_start_maximized_not_doubled():
     assert args.count("--start-maximized") == 1
 
 
+@pytest.fixture
+def linux_host():
+    with patch("platform.system", return_value="Linux"):
+        yield
+
+
+def test_no_hardware_profile_on_native_host():
+    """On a Mac or Windows host the persona is native and the real GPU renders."""
+    with patch("platform.system", return_value="Darwin"):
+        args = build_args(stealth_args=True, extra_args=["--fingerprint-platform=macos", "--fingerprint=1"])
+    assert _flag(args, "--fingerprint-gpu-renderer") is None
+
+
 def _windows_args(extra):
     return build_args(stealth_args=True, extra_args=["--fingerprint-platform=windows"] + extra)
 
@@ -244,7 +261,7 @@ def _flag(args, key):
     return next((a.split("=", 1)[1] for a in args if a.startswith(key + "=")), None)
 
 
-def test_windows_hardware_profile_follows_seed():
+def test_windows_hardware_profile_follows_seed(linux_host):
     """The Windows persona gets one coherent GPU/CPU/memory profile per seed."""
     first = _windows_args(["--fingerprint=56492"])
     again = _windows_args(["--fingerprint=56492"])
@@ -255,18 +272,25 @@ def test_windows_hardware_profile_follows_seed():
     assert _flag(first, "--fingerprint-device-memory") == "8"
 
 
-def test_windows_hardware_profile_varies_across_seeds():
+def test_windows_hardware_profile_varies_across_seeds(linux_host):
     renderers = {_flag(_windows_args([f"--fingerprint={seed}"]), "--fingerprint-gpu-renderer") for seed in range(40)}
     assert len(renderers) > 4
 
 
-def test_explicit_hardware_flag_disables_profile():
+def test_explicit_hardware_flag_disables_profile(linux_host):
     """A caller-set hardware flag is never mixed with a profile it does not belong to."""
     args = _windows_args(["--fingerprint=56492", "--fingerprint-gpu-renderer=Custom GPU"])
     assert _flag(args, "--fingerprint-gpu-renderer") == "Custom GPU"
     assert _flag(args, "--fingerprint-hardware-concurrency") is None
 
 
-def test_no_hardware_profile_for_macos_persona():
+def test_macos_hardware_profile_is_a_macbook_air_chip(linux_host):
     args = build_args(stealth_args=True, extra_args=["--fingerprint-platform=macos", "--fingerprint=1"])
+    assert _flag(args, "--fingerprint-gpu-vendor") == "Google Inc. (Apple)"
+    assert _flag(args, "--fingerprint-gpu-renderer").startswith("ANGLE (Apple, ANGLE Metal Renderer: Apple M")
+    assert _flag(args, "--fingerprint-hardware-concurrency") in {"8", "10"}
+
+
+def test_no_hardware_profile_for_unknown_persona(linux_host):
+    args = build_args(stealth_args=True, extra_args=["--fingerprint-platform=linux", "--fingerprint=1"])
     assert _flag(args, "--fingerprint-gpu-renderer") is None
