@@ -233,6 +233,8 @@ def window_geometry_fits(geometry: dict) -> bool:
 def viewport_origin(bounds: dict, viewport_height: float) -> tuple[int, int]:
     """Real screen position of a page's viewport top-left corner.
 
+    viewport_height is in screen pixels (page zoom applied).
+
     The page's own screenX/screenY are spoofed, so the origin comes from the real
     window bounds: the viewport sits inside the frame border, flush with the
     bottom of the window, below Chrome's toolbars. Assumes no horizontal
@@ -807,13 +809,16 @@ async def handle_close(request: web.Request) -> web.Response:
 INPUT_ACTION_TYPES = {"move", "path", "down", "up", "click", "wheel", "type", "key", "sleep"}
 
 
-def xdotool_commands(action: dict, origin: tuple[int, int]) -> list[tuple[float, list[str]]]:
-    """Translate one input action into (delay_seconds, xdotool argv) steps."""
+def xdotool_commands(action: dict, origin: tuple[int, int], zoom: float = 1.0) -> list[tuple[float, list[str]]]:
+    """Translate one input action into (delay_seconds, xdotool argv) steps.
+
+    Coordinates are CSS pixels; page zoom scales them to screen pixels.
+    """
     kind = action["type"]
     left, top = origin
 
     def move(x: float, y: float) -> list[str]:
-        return ["mousemove", str(round(left + x)), str(round(top + y))]
+        return ["mousemove", str(round(left + x * zoom)), str(round(top + y * zoom))]
 
     if kind == "move":
         return [(0.0, move(action["x"], action["y"]))]
@@ -874,18 +879,19 @@ async def handle_input(request: web.Request) -> web.Response:
         await cdp.send("Page.bringToFront")
         window = await cdp.send("Browser.getWindowForTarget")
         metrics = await cdp.send("Page.getLayoutMetrics")
-    viewport = metrics["cssVisualViewport"]
-    if viewport.get("zoom", 1) != 1 or viewport.get("scale", 1) != 1:
-        return web.json_response({"error": "native input needs an unzoomed page"}, status=409)
+    viewport = metrics["visualViewport"]
+    if viewport.get("scale", 1) != 1:
+        return web.json_response({"error": "native input needs a page without pinch zoom"}, status=409)
+    zoom = viewport.get("zoom", 1)
     origin = viewport_origin(window["bounds"], viewport["clientHeight"])
 
     for action in actions:
-        for delay, argv in xdotool_commands(action, origin):
+        for delay, argv in xdotool_commands(action, origin, zoom):
             if delay:
                 await asyncio.sleep(delay)
             if argv:
                 await _run_xdotool(argv)
-    return web.json_response({"ok": True, "origin": list(origin), "actions": len(actions)})
+    return web.json_response({"ok": True, "origin": list(origin), "zoom": zoom, "actions": len(actions)})
 
 
 async def handle_root(request: web.Request) -> web.Response:

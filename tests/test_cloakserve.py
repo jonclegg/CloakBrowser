@@ -842,6 +842,10 @@ class TestXdotoolCommands:
         steps = xdotool_commands({"type": "path", "points": [[10, 20, 0], [15.4, 22.6, 16]]}, (100, 200))
         assert steps == [(0.0, ["mousemove", "110", "220"]), (0.016, ["mousemove", "115", "223"])]
 
+    def test_page_zoom_scales_css_coordinates(self):
+        steps = xdotool_commands({"type": "move", "x": 100, "y": 40}, (217, 287), zoom=1.5)
+        assert steps == [(0.0, ["mousemove", "367", "347"])]
+
     def test_click_moves_first(self):
         steps = xdotool_commands({"type": "click", "x": 5, "y": 6}, (0, 173))
         assert steps == [(0.0, ["mousemove", "5", "179"]), (0.0, ["click", "1"])]
