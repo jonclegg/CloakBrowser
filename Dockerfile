@@ -33,9 +33,15 @@ RUN cd js && npm install && npm run build
 COPY examples/ examples/
 
 # Pre-download stealth Chromium binary during build (not at runtime)
-# Remove welcome marker so users see it on first container run
-RUN python -c "from cloakbrowser import ensure_binary; ensure_binary()" \
-    && rm -f ~/.cloakbrowser/.welcome_shown
+# Remove welcome marker so users see it on first container run.
+# PREFETCH_BINARY=false leaves it out: the Binary License forbids redistributing
+# it, so an image published by a third party must let each user's container
+# download it from CloakHQ on first start (cloakserve calls ensure_binary()).
+ARG PREFETCH_BINARY=true
+RUN if [ "$PREFETCH_BINARY" = "true" ]; then \
+        python -c "from cloakbrowser import ensure_binary; ensure_binary()" \
+        && rm -f ~/.cloakbrowser/.welcome_shown; \
+    fi
 
 # CLI shortcuts
 COPY bin/cloaktest /usr/local/bin/cloaktest

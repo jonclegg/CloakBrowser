@@ -606,14 +606,7 @@ class ChromePool:
         await asyncio.to_thread(self._safe_rmtree, user_data_dir)
 
     async def _settle_window(self, port: int) -> None:
-        """Size the window so the geometry pages see is a real one.
-
-        Below Chromium 148 the binary reports screenX/screenY at a seeded offset
-        that depends only on the window size, so a maximized window reports an
-        outer box running past the screen edge. Try common window sizes until the
-        reported box fits the available screen, then move the real window to the
-        reported spot so the display (and native input) match what pages see.
-        """
+        """Settle a fresh browser's window on about:blank, before any site loads."""
         async with aiohttp.ClientSession() as session:
             async with session.get(f"http://127.0.0.1:{port}/json/list") as resp:
                 targets = await resp.json()
@@ -621,113 +614,56 @@ class ChromePool:
         async with websockets.connect(page["webSocketDebuggerUrl"], max_size=None) as ws:
             cdp = CdpSession(ws)
             await cdp.send("Page.navigate", {"url": "about:blank"})
-            window_id = (await cdp.send("Browser.getWindowForTarget"))["windowId"]
-            await cdp.send("Browser.setWindowBounds", {"windowId": window_id, "bounds": {"windowState": "normal"}})
-            screen = await self._reported_geometry(cdp)
-            candidates = [
-                (round(screen["availWidth"] * fraction), round(screen["availHeight"] * fraction))
-                for fraction in WINDOW_SIZE_FRACTIONS
-            ]
-            for width, height in candidates:
-                await cdp.send("Browser.setWindowBounds", {"windowId": window_id, "bounds": {"width": width, "height": height}})
-                geometry = await self._reported_geometry(cdp)
-                if not window_geometry_fits(geometry):
-                    continue
-                await cdp.send("Browser.setWindowBounds", {
-                    "windowId": window_id,
-                    "bounds": {"left": geometry["screenX"], "top": geometry["screenY"]},
-                })
-                geometry = await self._reported_geometry(cdp)
-                if not window_geometry_fits(geometry):
-                    continue
-                logger.info(
-                    "Window %dx%d at %d,%d (screen %dx%d available)",
-                    width, height, geometry["screenX"], geometry["screenY"],
-                    geometry["availWidth"], geometry["availHeight"],
-                )
-                return
-        raise RuntimeError(f"no window size in {candidates} keeps the reported window on screen")
+            await settle_window(cdp)
 
-    @staticmethod
-    async def _reported_geometry(cdp: CdpSession) -> dict:
-        await asyncio.sleep(0.4)  # X11 applies window bounds asynchronously
-        result = await cdp.send("Runtime.evaluate", {
-            "expression": "({screenX, screenY, outerWidth, outerHeight, availLeft: screen.availLeft, "
-                          "availTop: screen.availTop, availWidth: screen.availWidth, availHeight: screen.availHeight})",
-            "returnByValue": True,
+
+async def reported_geometry(cdp: CdpSession) -> dict:
+    """The window and screen geometry a page reads (spoofed by the binary)."""
+    await asyncio.sleep(0.4)  # X11 applies window bounds asynchronously
+    result = await cdp.send("Runtime.evaluate", {
+        "expression": "({screenX, screenY, outerWidth, outerHeight, availLeft: screen.availLeft, "
+                      "availTop: screen.availTop, availWidth: screen.availWidth, availHeight: screen.availHeight})",
+        "returnByValue": True,
+    })
+    return result["result"]["value"]
+
+
+async def settle_window(cdp: CdpSession) -> dict:
+    """Size a page's window so the geometry pages see is a real one.
+
+    Below Chromium 148 the binary reports screenX/screenY at a seeded offset that
+    depends only on the window size, so a maximized window reports an outer box
+    running past the screen edge. Try window sizes, largest first, until the
+    reported box fits the available screen, then move the real window to the
+    reported spot so the display (and native input) match what pages see.
+    Reading the geometry has no side effects a page can observe.
+    """
+    window_id = (await cdp.send("Browser.getWindowForTarget"))["windowId"]
+    await cdp.send("Browser.setWindowBounds", {"windowId": window_id, "bounds": {"windowState": "normal"}})
+    screen = await reported_geometry(cdp)
+    candidates = [
+        (round(screen["availWidth"] * fraction), round(screen["availHeight"] * fraction))
+        for fraction in WINDOW_SIZE_FRACTIONS
+    ]
+    for width, height in candidates:
+        await cdp.send("Browser.setWindowBounds", {"windowId": window_id, "bounds": {"width": width, "height": height}})
+        geometry = await reported_geometry(cdp)
+        if not window_geometry_fits(geometry):
+            continue
+        await cdp.send("Browser.setWindowBounds", {
+            "windowId": window_id,
+            "bounds": {"left": geometry["screenX"], "top": geometry["screenY"]},
         })
-        return result["result"]["value"]
-
-    async def _cleanup_process(self, key: str) -> None:
-        """Terminate a Chrome process and clean up."""
-        self._cancel_idle_cleanup(key)
-        proc = self._processes.pop(key, None)
-        if not proc:
-            return
-        if proc.process.poll() is None:
-            proc.process.terminate()
-            try:
-                await asyncio.to_thread(proc.process.wait, timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.process.kill()
-        await asyncio.to_thread(self._safe_rmtree, proc.user_data_dir)
-        if self._default is proc:
-            self._default = None
-        self._locks.pop(key, None)
-        self._connections.pop(key, None)
-
-    async def terminate_seed(self, seed: str) -> bool:
-        """Terminate one seed's Chrome on demand, freeing its slot immediately.
-
-        Returns True if a process was running and got torn down, False if there
-        was nothing to terminate. The persistent profile is preserved: teardown
-        goes through _cleanup_process, whose _safe_rmtree the persistent pool
-        overrides to a no-op, so reopening the same seed later restores identity.
-        """
-        if not seed or not SAFE_SEED_RE.match(seed) or seed in RESERVED_SEEDS:
-            return False
-        async with self._get_lock(seed):
-            if seed not in self._processes:
-                return False
-            await self._cleanup_process(seed)
-            return True
-
-    async def shutdown(self) -> None:
-        """Terminate all Chrome processes."""
-        idle_tasks = list(self._idle_tasks.values())
-        self._idle_tasks.clear()
-        for task in idle_tasks:
-            if not task.done():
-                task.cancel()
-        if idle_tasks:
-            await asyncio.gather(*idle_tasks, return_exceptions=True)
-        for key in list(self._processes.keys()):
-            await self._cleanup_process(key)
-        logger.info("All Chrome processes terminated")
-
-    @staticmethod
-    async def _wait_for_cdp(port: int, timeout: float = 10.0) -> bool:
-        """Poll Chrome's /json/version until ready."""
-        deadline = time.monotonic() + timeout
-        delay = 0.1
-        session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=1)
+        geometry = await reported_geometry(cdp)
+        if not window_geometry_fits(geometry):
+            continue
+        logger.info(
+            "Window %dx%d at %d,%d (screen %dx%d available)",
+            width, height, geometry["screenX"], geometry["screenY"],
+            geometry["availWidth"], geometry["availHeight"],
         )
-        try:
-            while time.monotonic() < deadline:
-                try:
-                    async with session.get(
-                        f"http://127.0.0.1:{port}/json/version"
-                    ) as resp:
-                        if resp.status == 200:
-                            return True
-                except Exception:
-                    pass
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 1.0)
-            return False
-        finally:
-            await session.close()
+        return geometry
+    raise RuntimeError(f"no window size in {candidates} keeps the reported window on screen")
 
 
 # ---------------------------------------------------------------------------
@@ -858,8 +794,8 @@ async def _run_xdotool(argv: list[str]) -> None:
         raise RuntimeError(f"xdotool {' '.join(argv)} failed: {stderr.decode().strip()}")
 
 
-async def handle_input(request: web.Request) -> web.Response:
-    """Run native input actions against one page: POST {"target": id, "actions": [...]}."""
+def _reject_display_request(request: web.Request) -> web.Response | None:
+    """Guard for POST endpoints that act on the X display: local JSON callers only."""
     if request.headers.get("Origin") is not None and not _origin_is_allowed(
         request.headers.get("Origin"), request.headers.get("Host"),
     ):
@@ -867,12 +803,45 @@ async def handle_input(request: web.Request) -> web.Response:
     if request.content_type != "application/json":
         return web.json_response({"error": "Content-Type must be application/json"}, status=415)
     if not os.environ.get("DISPLAY"):
-        return web.json_response({"error": "native input needs a headed browser on an X display (DISPLAY unset)"}, status=501)
+        return web.json_response({"error": "needs a headed browser on an X display (DISPLAY unset)"}, status=501)
+    return None
+
+
+def _page_target(body: dict) -> str | None:
+    target = body.get("target")
+    if isinstance(target, str) and re.fullmatch(r"[A-Fa-f0-9]{8,64}", target):
+        return target
+    return None
+
+
+async def handle_window(request: web.Request) -> web.Response:
+    """Re-settle one page's window to a coherent size: POST {"target": id}.
+
+    For callers that find the window shrunk or maximized by another client.
+    """
+    rejected = _reject_display_request(request)
+    if rejected is not None:
+        return rejected
+    target = _page_target(await request.json())
+    if target is None:
+        return web.json_response({"error": "target must be a page target id"}, status=400)
+    pool: ChromePool = request.app["pool"]
+    cp = await pool.get_or_launch(seed=request.match_info.get("seed"))
+    async with websockets.connect(f"ws://127.0.0.1:{cp.cdp_port}/devtools/page/{target}", max_size=None) as ws:
+        geometry = await settle_window(CdpSession(ws))
+    return web.json_response({"ok": True, "geometry": geometry})
+
+
+async def handle_input(request: web.Request) -> web.Response:
+    """Run native input actions against one page: POST {"target": id, "actions": [...]}."""
+    rejected = _reject_display_request(request)
+    if rejected is not None:
+        return rejected
 
     body = await request.json()
-    target = body.get("target")
+    target = _page_target(body)
     actions = body.get("actions")
-    if not isinstance(target, str) or not re.fullmatch(r"[A-Fa-f0-9]{8,64}", target):
+    if target is None:
         return web.json_response({"error": "target must be a page target id"}, status=400)
     if not isinstance(actions, list) or not all(
         isinstance(action, dict) and action.get("type") in INPUT_ACTION_TYPES for action in actions
@@ -1272,6 +1241,8 @@ def main() -> None:
     app.router.add_post("/fingerprint/{seed}/close", handle_close)
     app.router.add_post("/fingerprint/{seed}/input", handle_input)
     app.router.add_post("/input", handle_input)
+    app.router.add_post("/fingerprint/{seed}/window", handle_window)
+    app.router.add_post("/window", handle_window)
     app.router.add_get("/fingerprint/{seed}/devtools/{path:.+}", handle_ws_seed)
     # WebSocket routes — default (no seed)
     app.router.add_get("/devtools/{path:.+}", handle_ws_default)
