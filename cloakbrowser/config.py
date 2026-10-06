@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import platform
 import random
@@ -74,6 +75,53 @@ def get_default_stealth_args() -> list[str]:
     # identical across seeds), so the wrapper must not emulate a viewport on top in
     # headed mode — that would break outerWidth >= innerWidth coherence.
     return base + ["--fingerprint-platform=windows"]
+
+
+# ---------------------------------------------------------------------------
+# Windows hardware profiles — keep GPU, CPU threads, and memory coherent.
+# Free binaries pair every seed with 8 threads and 8 GB whatever GPU the seed
+# lands on, which yields pairings no real machine has (an RTX 5090 next to 8
+# threads, a laptop GPU on a 1080p DPR-1 desktop screen). Each profile below is
+# a common desktop pairing; the seed picks one deterministically, so the same
+# seed is still the same machine. Desktop NVIDIA only, so the binary's D3D11
+# WebGL parameter set keeps matching the renderer string.
+# navigator.deviceMemory is capped at 8 by Chrome, so every profile reports 8.
+# ---------------------------------------------------------------------------
+WINDOWS_HARDWARE_PROFILES: tuple[tuple[str, int], ...] = (
+    ("NVIDIA GeForce GTX 1650 (0x00001F82)", 8),
+    ("NVIDIA GeForce GTX 1660 SUPER (0x000021C4)", 12),
+    ("NVIDIA GeForce RTX 2060 (0x00001F08)", 12),
+    ("NVIDIA GeForce RTX 3060 (0x00002503)", 12),
+    ("NVIDIA GeForce RTX 3060 (0x00002503)", 16),
+    ("NVIDIA GeForce RTX 3060 Ti (0x00002489)", 16),
+    ("NVIDIA GeForce RTX 3070 (0x00002484)", 16),
+    ("NVIDIA GeForce RTX 4060 (0x00002882)", 12),
+    ("NVIDIA GeForce RTX 4060 (0x00002882)", 16),
+    ("NVIDIA GeForce RTX 4060 Ti (0x00002803)", 16),
+    ("NVIDIA GeForce RTX 4070 (0x00002786)", 20),
+    ("NVIDIA GeForce RTX 4070 SUPER (0x00002783)", 20),
+)
+
+HARDWARE_PROFILE_FLAGS = (
+    "--fingerprint-gpu-vendor",
+    "--fingerprint-gpu-renderer",
+    "--fingerprint-hardware-concurrency",
+    "--fingerprint-device-memory",
+)
+
+
+def windows_hardware_profile_args(seed: str) -> list[str]:
+    """Return coherent GPU/CPU/memory flags for a Windows persona seed."""
+    digest = hashlib.sha256(seed.encode()).digest()
+    renderer, threads = WINDOWS_HARDWARE_PROFILES[
+        int.from_bytes(digest[:4], "big") % len(WINDOWS_HARDWARE_PROFILES)
+    ]
+    return [
+        "--fingerprint-gpu-vendor=Google Inc. (NVIDIA)",
+        f"--fingerprint-gpu-renderer=ANGLE (NVIDIA, {renderer} Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        f"--fingerprint-hardware-concurrency={threads}",
+        "--fingerprint-device-memory=8",
+    ]
 
 
 # ---------------------------------------------------------------------------

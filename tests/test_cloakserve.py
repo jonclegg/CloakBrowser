@@ -27,6 +27,11 @@ ChromePool = _mod.ChromePool
 _default_data_dir = _mod._default_data_dir
 _external_host = _mod._external_host
 _ws_scheme = _mod._ws_scheme
+ChromeProcess = _mod.ChromeProcess
+launch_conflicts = _mod.launch_conflicts
+window_geometry_fits = _mod.window_geometry_fits
+viewport_origin = _mod.viewport_origin
+xdotool_commands = _mod.xdotool_commands
 SAFE_SEED_RE = _mod.SAFE_SEED_RE
 RESERVED_SEEDS = _mod.RESERVED_SEEDS
 
@@ -93,8 +98,20 @@ class TestParseCliArgs:
         assert config["port"] == 9222
         assert config["headless"] is True
         assert config["data_dir"] is not None
-        assert config["idle_timeout"] == 0.0
+        assert config["idle_timeout"] == 300.0
+        assert config["max_processes"] == 8
+        assert config["geoip"] is False
         assert passthrough == []
+
+    def test_geoip_and_max_processes(self):
+        config, passthrough = parse_cli_args(["--geoip", "--max-processes=3"])
+        assert config["geoip"] is True
+        assert config["max_processes"] == 3
+        assert passthrough == []
+
+    def test_max_processes_must_be_positive(self):
+        with pytest.raises(ValueError):
+            parse_cli_args(["--max-processes=0"])
 
     def test_custom_port(self):
         config, _ = parse_cli_args(["--port=8080"])
@@ -103,8 +120,8 @@ class TestParseCliArgs:
     def test_headless_false(self):
         config, passthrough = parse_cli_args(["--headless=false"])
         assert config["headless"] is False
-        # headless flag still passed through to Chrome
-        assert "--headless=false" in passthrough
+        # Chromium treats any --headless switch as headless, so it is consumed
+        assert "--headless=false" not in passthrough
 
     def test_strips_remote_debugging_flags(self):
         args = ["--remote-debugging-port=9999", "--remote-debugging-address=0.0.0.0", "--no-sandbox"]
@@ -676,3 +693,163 @@ class TestSafeRmtree:
         pool._safe_rmtree(traversal)
 
         assert victim.exists(), "Traversal path must not be deleted"
+
+
+# ---------------------------------------------------------------------------
+# Default seed persistence, capacity, launch conflicts
+# ---------------------------------------------------------------------------
+
+
+def _live_process(**fields):
+    defaults = dict(
+        seed="1", process=SimpleNamespace(poll=lambda: None), cdp_port=5100,
+        user_data_dir="/tmp/x", last_used=0.0,
+    )
+    defaults.update(fields)
+    return ChromeProcess(**defaults)
+
+
+class TestDefaultSeedPersistence:
+    def _make_pool(self, tmp_path):
+        return ChromePool(binary="/fake/chrome", global_args=[], headless=True, data_dir=str(tmp_path))
+
+    def test_seed_created_once_and_reused(self, tmp_path):
+        pool = self._make_pool(tmp_path)
+        first = pool._persistent_default_seed(str(tmp_path))
+        second = pool._persistent_default_seed(str(tmp_path))
+        assert first == second
+        assert (tmp_path / ".cloakserve-seed").read_text().strip() == first
+
+    def test_existing_seed_file_wins(self, tmp_path):
+        (tmp_path / ".cloakserve-seed").write_text("56492\n")
+        assert self._make_pool(tmp_path)._persistent_default_seed(str(tmp_path)) == "56492"
+
+    def test_invalid_seed_file_fails(self, tmp_path):
+        (tmp_path / ".cloakserve-seed").write_text("../evil\n")
+        with pytest.raises(RuntimeError):
+            self._make_pool(tmp_path)._persistent_default_seed(str(tmp_path))
+
+
+class TestLaunchConflicts:
+    def test_bare_reconnect_has_no_conflict(self):
+        proc = _live_process(timezone="Europe/Berlin", locale="de-DE")
+        assert launch_conflicts(proc, None, None, None, None, False) == {}
+
+    def test_same_values_have_no_conflict(self):
+        proc = _live_process(timezone="Europe/Berlin", extra_args=("--fingerprint-platform=windows",))
+        assert launch_conflicts(proc, ["--fingerprint-platform=windows"], "Europe/Berlin", None, None, False) == {}
+
+    def test_different_values_conflict(self):
+        proc = _live_process(timezone="Europe/Berlin")
+        conflicts = launch_conflicts(proc, ["--fingerprint-taskbar-height=0"], "Asia/Tokyo", None, None, True)
+        assert set(conflicts) == {"fingerprint_args", "timezone", "geoip"}
+
+    def test_get_or_launch_rejects_conflicting_reconnect(self):
+        async def run():
+            pool = ChromePool(binary="/fake/chrome", global_args=[], headless=True, data_dir="/tmp/test-cloakserve")
+            pool._processes["seed1"] = _live_process(seed="seed1", timezone="Europe/Berlin")
+            with pytest.raises(aiohttp.web.HTTPConflict):
+                await pool.get_or_launch("seed1", timezone="Asia/Tokyo")
+            assert await pool.get_or_launch("seed1") is pool._processes["seed1"]
+
+        asyncio.run(run())
+
+
+class TestCapacity:
+    def _make_pool(self, max_processes=2, default_seed=None):
+        return ChromePool(
+            binary="/fake/chrome", global_args=[], headless=True,
+            data_dir="/tmp/test-cloakserve", max_processes=max_processes, default_seed=default_seed,
+        )
+
+    def test_evicts_least_recently_used_idle_seed(self):
+        async def run():
+            pool = self._make_pool()
+            pool._processes["old"] = _live_process(seed="old", last_used=1.0)
+            pool._processes["new"] = _live_process(seed="new", last_used=2.0)
+            closed = []
+
+            async def fake_cleanup(key):
+                closed.append(key)
+                pool._processes.pop(key)
+
+            pool._cleanup_process = fake_cleanup
+            await pool._make_room()
+            assert closed == ["old"]
+
+        asyncio.run(run())
+
+    def test_busy_and_default_are_never_evicted(self):
+        async def run():
+            pool = self._make_pool(default_seed="home")
+            pool._processes["home"] = _live_process(seed="home", last_used=0.0)
+            pool._processes["busy"] = _live_process(seed="busy", last_used=1.0)
+            pool._connections["busy"] = 1
+            with pytest.raises(aiohttp.web.HTTPServiceUnavailable):
+                await pool._make_room()
+
+        asyncio.run(run())
+
+    def test_default_identity_is_never_idle_reaped(self):
+        async def run():
+            pool = ChromePool(binary="/fake/chrome", global_args=[], headless=True,
+                              data_dir="/tmp/test-cloakserve", idle_timeout=0.01)
+            pool._processes["__default__"] = _live_process()
+            pool.connect("__default__")
+            pool.disconnect("__default__")
+            assert pool._idle_tasks == {}
+
+        asyncio.run(run())
+
+    def test_settle_window_drops_start_maximized(self):
+        pool = ChromePool(binary="/fake/chrome", global_args=["--start-maximized", "--no-sandbox"],
+                          headless=False, settle_window=True)
+        assert pool._global_args == ["--no-sandbox"]
+
+
+# ---------------------------------------------------------------------------
+# Window geometry and native input mapping
+# ---------------------------------------------------------------------------
+
+
+def _geometry(x, y, width, height):
+    return dict(screenX=x, screenY=y, outerWidth=width, outerHeight=height,
+                availLeft=0, availTop=0, availWidth=1920, availHeight=1032)
+
+
+class TestWindowGeometry:
+    def test_maximized_box_offset_past_edge_does_not_fit(self):
+        # What the free binary reports for a maximized window
+        assert not window_geometry_fits(_geometry(10, 47, 1920, 1032))
+
+    def test_box_inside_available_screen_fits(self):
+        assert window_geometry_fits(_geometry(424, 119, 1400, 900))
+
+    def test_box_past_taskbar_does_not_fit(self):
+        assert not window_geometry_fits(_geometry(114, 69, 1600, 1000))
+
+    def test_viewport_origin_maximized(self):
+        bounds = {"left": 0, "top": 0, "width": 1920, "height": 1080, "windowState": "maximized"}
+        assert viewport_origin(bounds, 907) == (0, 173)
+
+    def test_viewport_origin_normal_window(self):
+        bounds = {"left": 300, "top": 120, "width": 1200, "height": 800, "windowState": "normal"}
+        assert viewport_origin(bounds, 623) == (304, 293)
+
+
+class TestXdotoolCommands:
+    def test_path_offsets_points_and_keeps_delays(self):
+        steps = xdotool_commands({"type": "path", "points": [[10, 20, 0], [15.4, 22.6, 16]]}, (100, 200))
+        assert steps == [(0.0, ["mousemove", "110", "220"]), (0.016, ["mousemove", "115", "223"])]
+
+    def test_click_moves_first(self):
+        steps = xdotool_commands({"type": "click", "x": 5, "y": 6}, (0, 173))
+        assert steps == [(0.0, ["mousemove", "5", "179"]), (0.0, ["click", "1"])]
+
+    def test_type_and_key(self):
+        assert xdotool_commands({"type": "type", "text": "-n hi"}, (0, 0)) == [(0.0, ["type", "--delay", "90", "--", "-n hi"])]
+        assert xdotool_commands({"type": "key", "keys": "Return"}, (0, 0)) == [(0.0, ["key", "--", "Return"])]
+
+    def test_unknown_action_fails(self):
+        with pytest.raises(ValueError):
+            xdotool_commands({"type": "teleport"}, (0, 0))

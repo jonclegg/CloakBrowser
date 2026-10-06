@@ -230,3 +230,39 @@ def test_start_maximized_not_doubled():
         stealth_args=True, extra_args=["--start-maximized"], start_maximized=True
     )
     assert args.count("--start-maximized") == 1
+
+
+def _windows_args(extra):
+    return build_args(stealth_args=True, extra_args=["--fingerprint-platform=windows"] + extra)
+
+
+def _flag(args, key):
+    return next((a.split("=", 1)[1] for a in args if a.startswith(key + "=")), None)
+
+
+def test_windows_hardware_profile_follows_seed():
+    """The Windows persona gets one coherent GPU/CPU/memory profile per seed."""
+    first = _windows_args(["--fingerprint=56492"])
+    again = _windows_args(["--fingerprint=56492"])
+    assert _flag(first, "--fingerprint-gpu-renderer") == _flag(again, "--fingerprint-gpu-renderer")
+    assert _flag(first, "--fingerprint-gpu-vendor") == "Google Inc. (NVIDIA)"
+    assert _flag(first, "--fingerprint-gpu-renderer").startswith("ANGLE (NVIDIA, NVIDIA GeForce ")
+    assert _flag(first, "--fingerprint-hardware-concurrency") in {"8", "12", "16", "20"}
+    assert _flag(first, "--fingerprint-device-memory") == "8"
+
+
+def test_windows_hardware_profile_varies_across_seeds():
+    renderers = {_flag(_windows_args([f"--fingerprint={seed}"]), "--fingerprint-gpu-renderer") for seed in range(40)}
+    assert len(renderers) > 4
+
+
+def test_explicit_hardware_flag_disables_profile():
+    """A caller-set hardware flag is never mixed with a profile it does not belong to."""
+    args = _windows_args(["--fingerprint=56492", "--fingerprint-gpu-renderer=Custom GPU"])
+    assert _flag(args, "--fingerprint-gpu-renderer") == "Custom GPU"
+    assert _flag(args, "--fingerprint-hardware-concurrency") is None
+
+
+def test_no_hardware_profile_for_macos_persona():
+    args = build_args(stealth_args=True, extra_args=["--fingerprint-platform=macos", "--fingerprint=1"])
+    assert _flag(args, "--fingerprint-gpu-renderer") is None
