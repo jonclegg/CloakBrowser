@@ -866,3 +866,12 @@ class TestXdotoolCommands:
     def test_unknown_action_fails(self):
         with pytest.raises(ValueError):
             xdotool_commands({"type": "teleport"}, (0, 0))
+
+
+class TestPoolLifecycleMethods:
+    """get_or_launch, the idle reaper and shutdown call these; a refactor once dropped them."""
+
+    @pytest.mark.parametrize("name", ["_cleanup_process", "terminate_seed", "shutdown", "_wait_for_cdp",
+                                      "_settle_window", "_make_room", "_abandon_launch"])
+    def test_method_exists(self, name):
+        assert callable(getattr(ChromePool, name))
