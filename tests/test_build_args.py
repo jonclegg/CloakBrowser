@@ -11,9 +11,16 @@ def test_timezone_injected():
 
 def test_locale_injected():
     """--lang and --fingerprint-locale flags should appear when locale is set."""
-    args = build_args(stealth_args=True, extra_args=None, locale="en-US")
+    args = build_args(stealth_args=True, extra_args=None, locale="fr-FR")
+    assert "--lang=fr-FR" in args
+    assert "--fingerprint-locale=fr-FR" in args
+
+
+def test_default_locale_sets_lang_only():
+    """en-US is the binary's own locale; pinning it would split languages from Accept-Language."""
+    args = build_args(stealth_args=True, extra_args=["--fingerprint-locale=en-US"], locale="en-US")
     assert "--lang=en-US" in args
-    assert "--fingerprint-locale=en-US" in args
+    assert not any(a.startswith("--fingerprint-locale=") for a in args)
 
 
 def test_both_injected():
@@ -29,7 +36,6 @@ def test_timezone_independent_of_stealth_args():
     args = build_args(stealth_args=False, extra_args=None, timezone="America/New_York", locale="en-US")
     assert "--fingerprint-timezone=America/New_York" in args
     assert "--lang=en-US" in args
-    assert "--fingerprint-locale=en-US" in args
     # No stealth fingerprint args
     assert not any(a.startswith("--fingerprint=") for a in args)
 
@@ -126,9 +132,7 @@ def test_locale_param_overrides_user_arg():
     lang_args = [a for a in args if a.startswith("--lang=")]
     assert len(lang_args) == 1
     assert lang_args[0] == "--lang=en-US"
-    locale_args = [a for a in args if a.startswith("--fingerprint-locale=")]
-    assert len(locale_args) == 1
-    assert locale_args[0] == "--fingerprint-locale=en-US"
+    assert not any(a.startswith("--fingerprint-locale=") for a in args)
 
 
 def test_no_duplicate_flags():

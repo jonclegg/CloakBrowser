@@ -47,6 +47,10 @@ BINARY_SIGNING_PUBKEYS: list[str] = [
 # ---------------------------------------------------------------------------
 IGNORE_DEFAULT_ARGS = ["--enable-automation", "--enable-unsafe-swiftshader"]
 
+# The locale the binary presents with no --fingerprint-locale: navigator.languages
+# ["en-US", "en"] and Accept-Language "en-US,en;q=0.9", consistent with each other.
+BINARY_DEFAULT_LOCALE = "en-US"
+
 
 # ---------------------------------------------------------------------------
 # Default stealth arguments passed to the patched Chromium binary.

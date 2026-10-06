@@ -22,6 +22,7 @@ from typing import Any, Literal, TypedDict
 from urllib.parse import quote, unquote, urlparse, urlunparse
 
 from .config import (
+    BINARY_DEFAULT_LOCALE,
     DEFAULT_VIEWPORT,
     HARDWARE_PROFILE_FLAGS,
     IGNORE_DEFAULT_ARGS,
@@ -1463,7 +1464,15 @@ def build_args(
             logger.debug("Arg override: %s -> %s", seen[key], flag)
         seen[key] = flag
     if locale:
-        for key in ("--lang", "--fingerprint-locale"):
+        # --fingerprint-locale pins navigator.languages to the one locale while
+        # Accept-Language keeps the base language too (["en-US"] next to
+        # "en-US,en;q=0.9"), a mismatch a page and its server can compare. The
+        # binary's built-in locale is en-US with matching languages and header, so
+        # en-US sets --lang only.
+        keys = ("--lang",) if locale == BINARY_DEFAULT_LOCALE else ("--lang", "--fingerprint-locale")
+        if locale == BINARY_DEFAULT_LOCALE:
+            seen.pop("--fingerprint-locale", None)
+        for key in keys:
             flag = f"{key}={locale}"
             if key in seen:
                 logger.debug("Arg override: %s -> %s", seen[key], flag)
